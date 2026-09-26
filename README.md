@@ -25,14 +25,14 @@
 
 ---
 <video 
-  width="640" 
-  height="360" 
+  width="100%" 
+  max-width="800px"
   controls 
   preload="metadata"
-  poster="path/to/poster-image.jpg">
-  <source src="https://raw.githubusercontent.com/somratchandraroy/cc-toolkit/demo/preview.mp4" type="video/mp4">
+  style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+  <source src="https://raw.githubusercontent.com/SomratChandraRoy/cc-toolkit/main/demo/preview.mp4" type="video/mp4">
   Your browser does not support the video tag.
-</video>   
+</video>    
 ## Features
 
 | Mode | Description |
