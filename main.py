@@ -298,7 +298,7 @@ CONFIG = {
 
     # Timing / browser
     "timeout_ms": 45000,
-    "headless": False,
+    "headless": True,
     "slow_mo_ms": 0,
     "typing_delay_ms": 15,
     "hits_per_card": 1,
