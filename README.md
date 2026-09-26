@@ -285,6 +285,14 @@ All of this is configurable from the menu or Telegram.
 | Stop/restart messy | Wait for **Run finished** before `/run` again |
 | Playwright missing | `playwright install chromium` + `install-deps` |
 
+
+## 🚀 Quick Start
+
+### Get a Free VPS
+
+👉 **[Read the Free VPS Guide →](free-vps.md)**
+
+
 ---
 
 ## Disclaimer
