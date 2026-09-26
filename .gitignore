@@ -11,4 +11,4 @@ proxy_good.txt
 proxy_report.txt
 proxy.txt
 unknown.txt
-.ev
+.env
