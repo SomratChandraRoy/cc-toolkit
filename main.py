@@ -299,7 +299,7 @@ CONFIG = {
 
     # Timing / browser
     "timeout_ms": 45000,
-    "headless": True,
+    "headless": False,
     "slow_mo_ms": 0,
     "typing_delay_ms": 15,
     "hits_per_card": 1,
@@ -599,33 +599,43 @@ class ProxyBrowserManager:
                 and self.current_upstream == proxy_str):
             return True
         self.stop()
+        # Multiple URI formats for different pproxy versions
+        uri_list = []
         if user and pass_:
-            remote_uri = f"socks5://{host}:{port}#{user}:{pass_}"
+            uri_list = [
+                f"socks5://{user}:{pass_}@{host}:{port}",
+                f"socks5://{host}:{port}#{user}:{pass_}",
+            ]
         else:
-            remote_uri = f"socks5://{host}:{port}"
-        try:
-            self.proxy_process = subprocess.Popen(
-                [sys.executable, "-m", "pproxy",
-                 "-l", f"http://127.0.0.1:{self.local_port}",
-                 "-r", remote_uri],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            time.sleep(1.8)
-            if self.proxy_process.poll() is not None:
-                _, stderr = self.proxy_process.communicate()
-                err = (stderr or b"").decode(errors="ignore")[:180]
-                print(f"  {rgb(255,80,80)}[!] pproxy failed: {err}{RESET}")
-                self.proxy_process = None
+            uri_list = [f"socks5://{host}:{port}"]
+
+        last_err = ""
+        for remote_uri in uri_list:
+            try:
+                self.proxy_process = subprocess.Popen(
+                    [sys.executable, "-m", "pproxy",
+                     "-l", f"http://127.0.0.1:{self.local_port}",
+                     "-r", remote_uri],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                time.sleep(1.8)
+                if self.proxy_process.poll() is not None:
+                    _, stderr = self.proxy_process.communicate()
+                    last_err = (stderr or b"").decode(errors="ignore")[:180]
+                    self.proxy_process = None
+                    continue
+                self.current_upstream = proxy_str
+                return True
+            except FileNotFoundError:
+                print(f"  {rgb(255,80,80)}[!] pproxy not installed → pip install pproxy{RESET}")
                 return False
-            self.current_upstream = proxy_str
-            return True
-        except FileNotFoundError:
-            print(f"  {rgb(255,80,80)}[!] pproxy not installed → pip install pproxy{RESET}")
-            return False
-        except Exception as e:
-            print(f"  {rgb(255,80,80)}[!] pproxy start error: {e}{RESET}")
-            return False
+            except Exception as e:
+                last_err = str(e)
+                self.proxy_process = None
+                continue
+        print(f"  {rgb(255,80,80)}[!] pproxy failed: {last_err}{RESET}")
+        return False
 
     def force_restart(self, proxy_str: str) -> bool:
         print(f"  {rgb(255,200,0)}[!] Restarting pproxy bridge...{RESET}")
@@ -1065,7 +1075,9 @@ def detect_proxy_type(proxy_str: str) -> str:
         return "UNKNOWN (no scheme)"
     return "OTHER"
 
+
 def test_single_proxy(proxy_str: str, test_url: str = "https://api.ipify.org", timeout: float = 12.0) -> dict:
+    """Test one proxy. Prefer direct SOCKS (PySocks) then pproxy bridge."""
     result = {
         "proxy": proxy_str,
         "type": detect_proxy_type(proxy_str),
@@ -1077,99 +1089,169 @@ def test_single_proxy(proxy_str: str, test_url: str = "https://api.ipify.org", t
         "raw_error": "",
     }
 
-    if result["type"] != "SOCKS5":
-        result["reason"] = "Tool requires SOCKS5 (pproxy bridge)"
-        result["suitable"] = False
-        try:
-            import urllib.request
-            handler = urllib.request.ProxyHandler({"http": proxy_str, "https": proxy_str})
-            opener = urllib.request.build_opener(handler)
-            opener.addheaders = [("User-Agent", "Mozilla/5.0")]
-            t0 = time.time()
-            with opener.open(test_url, timeout=timeout) as resp:
-                ip = resp.read().decode().strip()
-                result["latency_ms"] = int((time.time() - t0) * 1000)
-                result["exit_ip"] = ip
-                result["alive"] = True
-                result["reason"] = f"Alive but type={result['type']} — use socks5:// for tool"
-        except Exception as e:
-            result["raw_error"] = str(e)[:100]
-            result["reason"] = f"Not SOCKS5 + connection failed: {result['raw_error']}"
-        return result
-
-    import socket as _socket
-    def free_port():
-        with _socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-
-    local_port = free_port()
     parsed = proxy_mgr._parse(proxy_str)
     if not parsed:
         result["reason"] = "Parse failed (bad format)"
         return result
     scheme, host, port, user, pass_ = parsed
-    if user and pass_:
-        remote_uri = f"socks5://{host}:{port}#{user}:{pass_}"
+
+    # ---------- Method A: direct SOCKS via urllib + PySocks ----------
+    def try_direct_socks():
+        try:
+            import socks  # PySocks
+            import socket as _socket
+            import urllib.request
+
+            # Build opener that uses SOCKS5
+            def _create_connection(address, timeout=timeout, source_address=None):
+                s = socks.socksocket()
+                s.set_proxy(
+                    socks.SOCKS5,
+                    host,
+                    int(port),
+                    username=user or None,
+                    password=pass_ or None,
+                    rdns=True,
+                )
+                s.settimeout(timeout)
+                s.connect(address)
+                return s
+
+            # Monkeypatch only for this request path via custom opener is hard;
+            # use requests if available, else raw socket HTTPS is complex — use requests
+            try:
+                import requests
+            except ImportError:
+                requests = None
+
+            if requests is not None:
+                if user and pass_:
+                    proxy_url = f"socks5h://{user}:{pass_}@{host}:{port}"
+                else:
+                    proxy_url = f"socks5h://{host}:{port}"
+                t0 = time.time()
+                r = requests.get(
+                    test_url,
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    timeout=timeout,
+                )
+                ip = r.text.strip()
+                latency = int((time.time() - t0) * 1000)
+                if r.status_code == 200 and ip:
+                    return True, latency, ip, ""
+                return False, None, None, f"HTTP {r.status_code}"
+            return False, None, None, "requests not installed"
+        except Exception as e:
+            return False, None, None, str(e)[:160]
+
+    # ---------- Method B: pproxy local bridge ----------
+    def try_pproxy():
+        import socket as _socket
+        def free_port():
+            with _socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                return s.getsockname()[1]
+
+        local_port = free_port()
+        # Try several remote URI forms (pproxy version differences)
+        candidates = []
+        if user and pass_:
+            candidates = [
+                f"socks5://{user}:{pass_}@{host}:{port}",
+                f"socks5://{host}:{port}#{user}:{pass_}",
+                f"socks5://{host}:{port}#{user}:{pass_}",
+            ]
+        else:
+            candidates = [f"socks5://{host}:{port}"]
+
+        last_err = ""
+        for remote_uri in candidates:
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    [
+                        sys.executable, "-m", "pproxy",
+                        "-l", f"http://127.0.0.1:{local_port}",
+                        "-r", remote_uri,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                time.sleep(1.8)
+                if proc.poll() is not None:
+                    out, err = proc.communicate()
+                    last_err = (err or out or b"").decode(errors="ignore")[:200]
+                    continue
+
+                local_url = f"http://127.0.0.1:{local_port}"
+                import urllib.request
+                handler = urllib.request.ProxyHandler({"http": local_url, "https": local_url})
+                opener = urllib.request.build_opener(handler)
+                opener.addheaders = [("User-Agent", "Mozilla/5.0")]
+                t0 = time.time()
+                with opener.open(test_url, timeout=timeout) as resp:
+                    ip = resp.read().decode().strip()
+                    latency = int((time.time() - t0) * 1000)
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    if ip:
+                        return True, latency, ip, ""
+                last_err = "empty response"
+            except Exception as e:
+                last_err = str(e)[:160]
+            finally:
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+        return False, None, None, last_err or "pproxy failed"
+
+    # Run tests
+    ok, latency, ip, err = try_direct_socks()
+    method = "direct-socks"
+    if not ok:
+        ok2, latency2, ip2, err2 = try_pproxy()
+        if ok2:
+            ok, latency, ip, err = ok2, latency2, ip2, err2
+            method = "pproxy"
+        else:
+            err = f"direct: {err} | pproxy: {err2}"
+
+    result["raw_error"] = err or ""
+    if ok and ip:
+        result["alive"] = True
+        result["latency_ms"] = latency
+        result["exit_ip"] = ip
+        if latency is not None and latency < 3000:
+            result["suitable"] = True
+            result["reason"] = f"Excellent ({method}) — fast SOCKS5"
+        elif latency is not None and latency < 7000:
+            result["suitable"] = True
+            result["reason"] = f"Good ({method}) — usable"
+        elif latency is not None and latency < 12000:
+            result["suitable"] = True
+            result["reason"] = f"Slow ({method}) — raise timeout"
+        else:
+            result["suitable"] = False
+            result["reason"] = f"Too slow ({method})"
     else:
-        remote_uri = f"socks5://{host}:{port}"
-
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "pproxy",
-             "-l", f"http://127.0.0.1:{local_port}",
-             "-r", remote_uri],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        time.sleep(1.6)
-        if proc.poll() is not None:
-            _, err = proc.communicate()
-            result["raw_error"] = (err or b"").decode(errors="ignore")[:120]
-            result["reason"] = f"pproxy failed: {result['raw_error']}"
-            return result
-
-        local_url = f"http://127.0.0.1:{local_port}"
-        import urllib.request
-        handler = urllib.request.ProxyHandler({"http": local_url, "https": local_url})
-        opener = urllib.request.build_opener(handler)
-        opener.addheaders = [("User-Agent", "Mozilla/5.0")]
-        t0 = time.time()
-        with opener.open(test_url, timeout=timeout) as resp:
-            ip = resp.read().decode().strip()
-            latency = int((time.time() - t0) * 1000)
-            result["latency_ms"] = latency
-            result["exit_ip"] = ip
-            result["alive"] = True
-            if latency < 3000:
-                result["suitable"] = True
-                result["reason"] = "Excellent — fast SOCKS5, good for tool"
-            elif latency < 7000:
-                result["suitable"] = True
-                result["reason"] = "Good — usable (raise timeout if needed)"
-            elif latency < 12000:
-                result["suitable"] = True
-                result["reason"] = "Slow but alive — set timeout 45000+"
-            else:
-                result["suitable"] = False
-                result["reason"] = "Too slow — will cause timeouts"
-    except Exception as e:
-        result["raw_error"] = str(e)[:120]
-        result["reason"] = f"Connection failed: {result['raw_error']}"
         result["alive"] = False
         result["suitable"] = False
-    finally:
-        if proc:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        result["reason"] = f"Connection failed: {(err or '')[:120]}"
     return result
+
+
 
 def run_proxy_check():
     os.system("cls" if os.name == "nt" else "clear")
